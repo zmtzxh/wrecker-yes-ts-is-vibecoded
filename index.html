@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Video Wrecker</title>
+<style>
+:root{--blue:#2338e8;--ink:#0d1233;--paper:#eef1ff;--yel:#ffd23f;--red:#ff3b30;color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:var(--blue);color:#fff;font:16px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:640px;margin:0 auto;padding:28px 16px 56px}
+h1{font-size:clamp(40px,11vw,64px);line-height:.95;letter-spacing:-.04em;margin:0 0 8px;font-weight:900}
+.sub{margin:0 0 20px;color:#cfd6ff}
+.pick{display:block;padding:18px;border:2px dashed #fff;border-radius:14px;text-align:center;font-weight:700;cursor:pointer;margin-bottom:14px;overflow-wrap:anywhere}
+.pick:hover,.pick:focus-within{background:rgba(255,255,255,.12)}
+video{display:block;width:100%;max-height:50vh;background:#000;border-radius:14px}
+.panel{background:var(--paper);color:var(--ink);border-radius:14px;padding:6px 16px 10px;margin:14px 0}
+.s{padding:10px 0;border-bottom:1px solid #c9d0f5}
+.s:last-child{border:0}
+.s label{display:flex;justify-content:space-between;font-weight:700;font-size:15px}
+.s b{color:var(--blue);font-variant-numeric:tabular-nums}
+input[type=range]{width:100%;margin:8px 0 0;accent-color:var(--blue);height:28px}
+.btn,button{display:block;width:100%;padding:16px;border:0;border-radius:14px;font:inherit;font-weight:800;font-size:18px;cursor:pointer;text-align:center;text-decoration:none;background:var(--yel);color:var(--ink)}
+button:disabled{opacity:.45;cursor:not-allowed}
+button.on{background:var(--red);color:#fff}
+:focus-visible{outline:3px solid #fff;outline-offset:2px}
+.note{font-size:14px;color:#cfd6ff;margin:10px 0}
+#status{min-height:1.5em;font-weight:700}
+#result{margin-top:22px}
+#result h2{margin:0 0 10px;font-size:22px}
+#dl{margin-top:12px}
+</style>
+</head>
+<body>
+<main>
+<h1>Video Wrecker</h1>
+<p class="sub">Pick a video, wreck its audio, preview it, save it.</p>
+
+<label class="pick" for="file"><span id="fname">Choose a video file</span>
+<input id="file" type="file" accept="video/*" hidden></label>
+
+<video id="v" controls playsinline></video>
+
+<div class="panel" id="panel"></div>
+
+<p class="note">Output gets extremely loud. Keep the monitor level low and your device volume down. The monitor level only changes what you hear, not the saved file.</p>
+
+<button id="rec" disabled>Record and download</button>
+<p id="status" role="status"></p>
+
+<section id="result" hidden>
+<h2>Result</h2>
+<video id="out" controls playsinline></video>
+<a id="dl" class="btn" download>Download video</a>
+</section>
+<p class="note">Saving plays the video through once in real time, so it takes as long as the video. Works best in desktop Chrome, Edge or Firefox.</p>
+</main>
+
+<script>
+const $=id=>document.getElementById(id);
+const v=$('v'),out=$('out'),rec=$('rec'),status=$('status');
+const P=[
+ ['mult','Overall strength (times)',1,30,.5,1],
+ ['bass','Bass boost (dB)',0,80,1,24],
+ ['bits','Bit depth (lower is crunchier)',1,16,1,6],
+ ['down','Sample-rate crush (higher is crunchier)',1,200,1,6],
+ ['dist','Distortion',0,3000,5,50],
+ ['vol','Volume (times)',1,1000,1,5],
+ ['squash','Squash (makes quiet parts louder)',0,100,1,30],
+ ['boom','Tinny cut-out sensitivity (0 is off)',0,100,1,60],
+ ['boomvol','Tinny cut-out loudness',0,5,.1,1.5],
+ ['mon','Monitor level (speakers only)',0,1,.01,.25]
+];
+const val={};
+P.forEach(([k,label,min,max,step,def])=>{
+  val[k]=def;
+  const d=document.createElement('div');d.className='s';
+  d.innerHTML=`<label for="r-${k}">${label}<b id="o-${k}">${def}</b></label><input id="r-${k}" type="range" min="${min}" max="${max}" step="${step}" value="${def}">`;
+  $('panel').appendChild(d);
+  d.querySelector('input').oninput=e=>{val[k]=+e.target.value;$('o-'+k).textContent=val[k];apply();};
+});
+
+let ctx,nodes,rdest,url,name='video',mr=null,lastBoom=-9;
+
+function setup(){
+  if(ctx)return;
+  ctx=new(window.AudioContext||window.webkitAudioContext)();
+  const src=ctx.createMediaElementSource(v);
+  const low=ctx.createBiquadFilter();low.type='lowshelf';low.frequency.value=110;
+  const low2=ctx.createBiquadFilter();low2.type='lowshelf';low2.frequency.value=110;
+  const pk=ctx.createBiquadFilter();pk.type='peaking';pk.frequency.value=60;pk.Q.value=1.2;
+  const crush=ctx.createScriptProcessor(4096,2,2);
+  const comp=ctx.createDynamicsCompressor();comp.ratio.value=20;comp.knee.value=0;comp.attack.value=.002;comp.release.value=.08;
+  const ph=[0,0],last=[0,0];
+  crush.onaudioprocess=e=>{
+    const m=val.mult,step=Math.pow(2,1-Math.max(.3,val.bits/m)),inc=1/(val.down*m);
+    for(let c=0;c<2;c++){
+      const i=e.inputBuffer.getChannelData(c),o=e.outputBuffer.getChannelData(c);
+      for(let n=0;n<i.length;n++){
+        ph[c]+=inc;
+        if(ph[c]>=1){ph[c]-=1;last[c]=Math.round(i[n]/step)*step;}
+        o[n]=last[c];
+      }
+    }
+  };
+  const shaper=ctx.createWaveShaper();shaper.oversample='4x';
+  const vol=ctx.createGain(),duck=ctx.createGain(),thinHP=ctx.createBiquadFilter(),thinLP=ctx.createBiquadFilter(),thinGain=ctx.createGain();
+  thinHP.type='highpass';thinHP.frequency.value=700;thinLP.type='lowpass';thinLP.frequency.value=3200;thinGain.gain.value=0;
+  const clip=ctx.createWaveShaper();clip.curve=new Float32Array([-1,1]);
+  const mon=ctx.createGain();
+  rdest=ctx.createMediaStreamDestination();
+  src.connect(low);low.connect(low2);low2.connect(pk);pk.connect(comp);comp.connect(crush);crush.connect(shaper);
+  shaper.connect(vol);vol.connect(duck);duck.connect(clip);shaper.connect(thinHP);thinHP.connect(thinLP);thinLP.connect(thinGain);thinGain.connect(clip);clip.connect(rdest);clip.connect(mon);mon.connect(ctx.destination);
+  nodes={low,low2,pk,comp,shaper,vol,mon,duck,thinLP,thinGain};
+  const det=ctx.createScriptProcessor(1024,2,1);
+  src.connect(det);det.connect(ctx.destination);
+  det.onaudioprocess=e=>{
+    if(!(val.boom>0&&val.boomvol>0))return;
+    let pk=0;
+    for(let c=0;c<2;c++){const i=e.inputBuffer.getChannelData(c);for(let n=0;n<i.length;n++){const a=Math.abs(i[n]);if(a>pk)pk=a;}}
+    if(pk>1-val.boom*.0095&&ctx.currentTime-lastBoom>1.4){lastBoom=ctx.currentTime;boom();}
+  };
+  apply();
+}
+
+function boom(){
+  const t=ctx.currentTime,n=nodes,dg=n.duck.gain,tg=n.thinGain.gain,lp=n.thinLP.frequency;
+  dg.cancelScheduledValues(t);dg.setTargetAtTime(0,t,.01);dg.setTargetAtTime(1,t+.7,.15);
+  tg.cancelScheduledValues(t);tg.setTargetAtTime(.4*val.boomvol,t,.01);tg.setTargetAtTime(0,t+.7,.15);
+  lp.cancelScheduledValues(t);lp.setValueAtTime(3200,t);lp.exponentialRampToValueAtTime(900,t+.65);
+}
+
+function apply(){
+  if(!nodes)return;
+  const m=val.mult,b=Math.min(val.bass*m,200),dist=val.dist*m;
+  nodes.low.gain.value=b/2;nodes.low2.gain.value=b/2;
+  nodes.pk.gain.value=b*.4;
+  nodes.vol.gain.value=val.vol*m;
+  nodes.comp.threshold.value=-val.squash*.8;
+  nodes.mon.gain.value=val.mon;
+  if(dist<=0){nodes.shaper.curve=null;return;}
+  const k=1+dist/4,n=8193,c=new Float32Array(n),norm=Math.tanh(k);
+  for(let i=0;i<n;i++)c[i]=Math.tanh((i/4096-1)*k)/norm;
+  nodes.shaper.curve=c;
+}
+
+$('file').onchange=e=>{
+  const f=e.target.files[0];if(!f)return;
+  if(url)URL.revokeObjectURL(url);
+  url=URL.createObjectURL(f);
+  v.src=url;
+  $('fname').textContent=f.name;
+  name=f.name.replace(/\.[^.]+$/,'');
+  $('result').hidden=true;
+  status.textContent='';
+  rec.disabled=false;
+  setup();
+};
+v.addEventListener('play',()=>ctx&&ctx.resume());
+
+rec.onclick=async()=>{
+  if(mr){mr.stop();return;}
+  const cap=v.captureStream||v.mozCaptureStream;
+  if(!cap||!window.MediaRecorder){status.textContent='This browser cannot record video. Try desktop Chrome, Edge or Firefox.';return;}
+  try{
+    setup();await ctx.resume();
+    v.pause();v.currentTime=0;v.loop=false;
+    const vs=cap.call(v);
+    const stream=new MediaStream([...vs.getVideoTracks(),...rdest.stream.getAudioTracks()]);
+    const mime=['video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm','video/mp4'].find(t=>MediaRecorder.isTypeSupported(t));
+    const chunks=[];
+    const r=new MediaRecorder(stream,Object.assign({videoBitsPerSecond:8e6},mime?{mimeType:mime}:{}));
+    mr=r;
+    r.ondataavailable=e=>{if(e.data.size)chunks.push(e.data);};
+    r.onstop=()=>{
+      v.pause();v.onended=null;v.ontimeupdate=null;
+      const type=(r.mimeType||'video/webm').split(';')[0];
+      const blob=new Blob(chunks,{type});
+      const href=URL.createObjectURL(blob);
+      out.src=href;
+      $('dl').href=href;
+      $('dl').download=name+'-wrecked.'+(type.includes('mp4')?'mp4':'webm');
+      $('result').hidden=false;
+      rec.textContent='Record and download';rec.classList.remove('on');
+      status.textContent='Done. Preview it below, then download.';
+      mr=null;
+    };
+    v.onended=()=>r.stop();
+    v.ontimeupdate=()=>{status.textContent='Recording '+Math.round(v.currentTime/v.duration*100)+'%';};
+    r.start(1000);
+    await v.play();
+    rec.textContent='Stop and save';rec.classList.add('on');
+  }catch(err){
+    mr=null;status.textContent='Could not record: '+err.message;
+  }
+};
+</script>
+</body>
+</html>
